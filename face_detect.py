@@ -6,7 +6,7 @@ import cv2
 import argparse
 import os
 import subprocess
-import threading
+import time
 
 def str2bool(v):
     if v.lower() in ['on', 'yes', 'true', 'y', 't']:
@@ -35,7 +35,7 @@ args = parser.parse_args()
 def playSound(audio_file):
     subprocess.Popen(["afplay", audio_file])
 
-def recognize(match_face, match_image, recognizer, identities, cosine_similarity_threshold = 0.363):
+def recognize(match_face, match_image, recognizer, identities: dict[str, np.ndarray], cosine_similarity_threshold = 0.363):
     """ returns identity with highest cosine similarity index if 
         any identity meets cosine similarity threshold
 
@@ -49,30 +49,28 @@ def recognize(match_face, match_image, recognizer, identities, cosine_similarity
     Returns:
         _type_: _description_
     """
-    similarities: dict[str,list[float]] = {}
+    similarities: dict[str,float] = {}
 
-    for identity in identities:
+    # Align faces
+    match_align = recognizer.alignCrop(match_image, match_face)
 
-        # Align faces
-        match_align = recognizer.alignCrop(match_image, match_face)
+    # Extract features
+    match_features = recognizer.feature(match_align)
 
-        # Extract features
-        match_features = recognizer.feature(match_align)
+    for identity, feature in identities.items():
         ## [facerecognizer]
 
         ## [match]
-        cosine_score = recognizer.match(match_features, identity[0], cv2.FaceRecognizerSF_FR_COSINE)
+        cosine_score = recognizer.match(match_features, feature, cv2.FaceRecognizerSF_FR_COSINE)
 
         # add cosine score for face to identities matching dictionary
-        if identity[1] not in similarities:
-            similarities[identity[1]] = []
-        similarities[identity[1]].append(cosine_score)
+        similarities[identity] = cosine_score
 
     # get best mean cosine similarity score
-    best_identity = max(similarities, key=lambda x: np.mean(similarities[x]))
+    best_identity = max(similarities, key=lambda x: similarities[x])
 
     # return best matching identity if it exceeds the cosine similarity threshold
-    return best_identity if np.mean(similarities[best_identity]) > cosine_similarity_threshold else None
+    return best_identity if similarities[best_identity] > cosine_similarity_threshold else None
 
 
 def rect_center(frame: cv2.Mat, coords: np.ndarray) -> bool:
@@ -106,11 +104,12 @@ def extract_identities(database: str) -> tuple[list[tuple], any]:
         tuple[list[tuple], any]: list of database identities and facial recognition model
     """    
     if database is not None:
-        identities: list[tuple] = []
+        identities: dict[str, list] = {}
         recognizer = cv2.FaceRecognizerSF.create(
                 args.face_recognition_model,"")
         for directory in os.listdir(database):
             if  not os.path.isdir('%s/%s' % (database, directory)): continue
+            identities[directory] = []
             for file in os.listdir('%s/%s' % (database, directory)):
                 img = cv2.imread('%s/%s/%s' % (database, directory, file))
                 imgWidth = int(img.shape[1]*args.scale)
@@ -130,7 +129,8 @@ def extract_identities(database: str) -> tuple[list[tuple], any]:
 
                 # Extract features
                 face_feature = recognizer.feature(face_align)
-                identities.append((face_feature, directory))
+                identities[directory].append(face_feature)
+        identities: dict[str, np.ndarray] = {identity:np.average(np.array(feature), axis=0) for (identity, feature) in identities.items()}
 
         return identities, recognizer
     
@@ -272,6 +272,7 @@ if __name__ == '__main__':
         detector.setInputSize([frameWidth, frameHeight])
 
         while cv2.waitKey(1) < 0:
+            start = time.process_time()
             hasFrame, frame = cap.read()
             if not hasFrame:
                 print('No frames grabbed!')
@@ -289,4 +290,6 @@ if __name__ == '__main__':
 
             # Visualize results
             cv2.imshow('Live', frame)
+            end = time.process_time()
+            print(end - start)
     cv2.destroyAllWindows()
