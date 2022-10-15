@@ -7,6 +7,11 @@ import argparse
 import os
 import subprocess
 import time
+import json
+
+identities: dict[int, str] = None
+identity_feature_matrix: np.ndarray = None
+clock = time.process_time
 
 def str2bool(v):
     if v.lower() in ['on', 'yes', 'true', 'y', 't']:
@@ -16,7 +21,6 @@ def str2bool(v):
     else:
         raise NotImplementedError
 
-soundit = True
 parser = argparse.ArgumentParser()
 parser.add_argument('--image1', '-i1', type=str, help='Path to the input image1. Omit for detecting on default camera.')
 parser.add_argument('--image2', '-i2', type=str, help='Path to the input image2. When image1 and image2 parameters given then the program try to find a face on both images and runs face recognition algorithm.')
@@ -32,45 +36,41 @@ parser.add_argument('--top_k', type=int, default=5000, help='Keep top_k bounding
 parser.add_argument('--save', '-s', type=str2bool, default=False, help='Set true to save results. This flag is invalid when using camera.')
 args = parser.parse_args()
 
-def playSound(audio_file):
-    subprocess.Popen(["afplay", audio_file])
-
-def recognize(match_face, match_image, recognizer, identities: dict[str, np.ndarray], cosine_similarity_threshold = 0.363):
+def recognize(match_face, match_image, cosine_similarity_threshold = 0.363):
     """ returns identity with highest cosine similarity index if 
         any identity meets cosine similarity threshold
 
     Args:
         match_face (_type_): face detected in frame
         match_image (_type_): image where face was detected
-        recognizer (_type_): facial recognition model
-        identities (_type_): list of identities from database
         cosine_similarity_threshold (float, optional): cosine similarity threshold. Defaults to 0.363.
 
     Returns:
         _type_: _description_
     """
-    similarities: dict[str,float] = {}
+
+    global recognizer
+    global identities
+    global identity_feature_matrix
 
     # Align faces
+    start = clock()
     match_align = recognizer.alignCrop(match_image, match_face)
 
     # Extract features
-    match_features = recognizer.feature(match_align)
+    match_features = np.squeeze(recognizer.feature(match_align))
+    end = clock()
+    print('Recognize: %.3f' % (end - start))
+    
+    cosine_similarity_matrix: np.ndarray = np.dot(identity_feature_matrix, match_features) / \
+        (np.linalg.norm(identity_feature_matrix, axis=1) * np.linalg.norm(match_features))
+    
+    argmax_cosine_similarity: np.ndarray = np.argmax(cosine_similarity_matrix)
 
-    for identity, feature in identities.items():
-        ## [facerecognizer]
-
-        ## [match]
-        cosine_score = recognizer.match(match_features, feature, cv2.FaceRecognizerSF_FR_COSINE)
-
-        # add cosine score for face to identities matching dictionary
-        similarities[identity] = cosine_score
-
-    # get best mean cosine similarity score
-    best_identity = max(similarities, key=lambda x: similarities[x])
-
-    # return best matching identity if it exceeds the cosine similarity threshold
-    return best_identity if similarities[best_identity] > cosine_similarity_threshold else None
+    if cosine_similarity_matrix[argmax_cosine_similarity] > cosine_similarity_threshold:
+        return identities[argmax_cosine_similarity]
+    else:
+        return None
 
 
 def rect_center(frame: cv2.Mat, coords: np.ndarray) -> bool:
@@ -92,7 +92,7 @@ def rect_center(frame: cv2.Mat, coords: np.ndarray) -> bool:
     return face_start_x <= frame_center_x <= face_end_x \
         and face_start_y <= frame_center_y <= face_end_y
 
-def extract_identities(database: str) -> tuple[list[tuple], any]:
+def extract_identities(database: str):
     """ uses database on same directory level to return 
         a trained facial recongition model and a list of 
         identities.
@@ -103,39 +103,21 @@ def extract_identities(database: str) -> tuple[list[tuple], any]:
     Returns:
         tuple[list[tuple], any]: list of database identities and facial recognition model
     """    
-    if database is not None:
-        identities: dict[str, list] = {}
-        recognizer = cv2.FaceRecognizerSF.create(
-                args.face_recognition_model,"")
-        for directory in os.listdir(database):
-            if  not os.path.isdir('%s/%s' % (database, directory)): continue
-            identities[directory] = []
-            for file in os.listdir('%s/%s' % (database, directory)):
-                img = cv2.imread('%s/%s/%s' % (database, directory, file))
-                imgWidth = int(img.shape[1]*args.scale)
-                imgHeight = int(img.shape[0]*args.scale)
 
-                img = cv2.resize(img, (imgWidth, imgHeight))
+    # import global identity feature matrix
+    global identity_feature_matrix
+    global identities
+    global recognizer
 
-                ## [inference]
-                # Set input size before inference
-                detector.setInputSize((imgWidth, imgHeight))
+    # read in identity mappings
+    with open('%s/identities.json' % (database), 'r') as identities_infile:
+        identities = {int(key):value for (key, value) in json.load(identities_infile).items()}
 
-                faces = detector.detect(img)
-                if type(faces[1]) is NoneType: continue
+    # read in identity feature matrix
+    with open('%s/embeddings.json' % (database), 'r') as embeddings_infile:
+        identity_feature_matrix = np.array(json.load(embeddings_infile))
 
-                # Align faces
-                face_align = recognizer.alignCrop(img, faces[1][0])
-
-                # Extract features
-                face_feature = recognizer.feature(face_align)
-                identities[directory].append(face_feature)
-        identities: dict[str, np.ndarray] = {identity:np.average(np.array(feature), axis=0) for (identity, feature) in identities.items()}
-
-        return identities, recognizer
-    
-
-def visualize(frame: cv2.Mat, faces, fps, thickness=2, recognizer=None, identities=None):
+def visualize(frame: cv2.Mat, faces, fps, thickness=2):
     """ draws face outlines and identities(if applicable) onto input frame.
 
     Args:
@@ -143,12 +125,15 @@ def visualize(frame: cv2.Mat, faces, fps, thickness=2, recognizer=None, identiti
         faces: list of faces returned from detector.
         fps: frames per second.
         thickness (int, optional): thickness of outline box in pixels.. Defaults to 2.
-        recognizer (_type_, optional): facial recognition model. Defaults to None.
-        identities (_type_, optional): identities of database individuals. Defaults to None.
     """    
+
+
+    global recognizer
+    global identities
+
     if faces[1] is not None:
         for idx, face in enumerate(faces[1]):
-            # print('Face {}, top-left coordinates: ({:.0f}, {:.0f}), box width: {:.0f}, box height {:.0f}, score: {:.2f}'.format(idx, face[0], face[1], face[2], face[3], face[-1]))
+            print('Face {}, top-left coordinates: ({:.0f}, {:.0f}), box width: {:.0f}, box height {:.0f}, score: {:.2f}'.format(idx, face[0], face[1], face[2], face[3], face[-1]))
 
             coords = face[:-1].astype(np.int32)
             cv2.rectangle(frame, (coords[0], coords[1]), (coords[0]+coords[2], coords[1]+coords[3]), (0, 255, 0), thickness)
@@ -159,14 +144,20 @@ def visualize(frame: cv2.Mat, faces, fps, thickness=2, recognizer=None, identiti
             cv2.circle(frame, (coords[12], coords[13]), 2, (0, 255, 255), thickness)
 
             # print face label if recognized
-            if recognizer and identities:
-                identity = recognize(face, frame, recognizer, identities)
+            start = time.process_time()
+            if recognizer:
+                identity = recognize(face, frame)
                 if identity and rect_center(frame, coords):
+                    pass
                     cv2.putText(frame, identity, (coords[0] + 15, coords[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            end = time.process_time()
+            print('Recognize time: %.3f' % (end - start))
 
     cv2.putText(frame, 'FPS: {:.2f}'.format(fps), (1, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
 if __name__ == '__main__':
+
+    global recognizer
 
     ## [initialize_FaceDetectorYN]
     detector = cv2.FaceDetectorYN.create(
@@ -178,118 +169,49 @@ if __name__ == '__main__':
         args.top_k
     )
 
+    # initialize recognizer
+    recognizer = cv2.FaceRecognizerSF.create(
+                args.face_recognition_model,"")
+
     tm = cv2.TickMeter()
 
-    # If input is an image
-    if args.image1 is not None:
-        img1 = cv2.imread(cv2.samples.findFile(args.image1))
-        img1Width = int(img1.shape[1]*args.scale)
-        img1Height = int(img1.shape[0]*args.scale)
+    start_1 = time.process_time()
+    extract_identities(args.database)
+    end_1 = time.process_time()
+    print('Extract Identities: %.3f' % (end_1 - start_1))
 
-        img1 = cv2.resize(img1, (img1Width, img1Height))
+    if args.video is not None:
+        print(args.video)
+        deviceId = int(args.video)
+    else:
+        deviceId = 0
+    cap = cv2.VideoCapture(deviceId)
+    frameWidth = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)*args.scale)
+    frameHeight = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)*args.scale)
+    detector.setInputSize([frameWidth, frameHeight])
+
+    while cv2.waitKey(1) < 0:
+        start = time.process_time()
+        hasFrame, frame = cap.read()
+        if not hasFrame:
+            print('No frames grabbed!')
+            break
+
+        frame: cv2.Mat = cv2.resize(frame, (frameWidth, frameHeight))
+
+        # Inference
         tm.start()
-
-        ## [inference]
-        # Set input size before inference
-        detector.setInputSize((img1Width, img1Height))
-
-        faces1 = detector.detect(img1)
-        ## [inference]
-
+        start = clock()
+        faces = detector.detect(frame) # faces is a tuple
+        end = clock()
+        print('Detect: %.3f' % (end - start))
         tm.stop()
-        assert faces1[1] is not None, 'Cannot find a face in {}'.format(args.image1)
 
         # Draw results on the input image
-        visualize(img1, faces1, tm.getFPS())
+        visualize(frame, faces, tm.getFPS())
 
-        # Save results if save is true
-        if args.save:
-            print('Results saved to result.jpg\n')
-            cv2.imwrite('result.jpg', img1)
-
-        # Visualize results in a new window
-        cv2.imshow("image1", img1)
-
-        if args.image2 is not None:
-            img2 = cv2.imread(cv2.samples.findFile(args.image2))
-
-            tm.reset()
-            tm.start()
-            detector.setInputSize((img2.shape[1], img2.shape[0]))
-            faces2 = detector.detect(img2)
-            tm.stop()
-            assert faces2[1] is not None, 'Cannot find a face in {}'.format(args.image2)
-            visualize(img2, faces2, tm.getFPS())
-            cv2.imshow("image2", img2)
-
-            ## [initialize_FaceRecognizerSF]
-            recognizer = cv2.FaceRecognizerSF.create(
-            args.face_recognition_model,"")
-            ## [initialize_FaceRecognizerSF]
-
-            ## [facerecognizer]
-            # Align faces
-            face1_align = recognizer.alignCrop(img1, faces1[1][0])
-            face2_align = recognizer.alignCrop(img2, faces2[1][0])
-
-            # Extract features
-            face1_feature = recognizer.feature(face1_align)
-            face2_feature = recognizer.feature(face2_align)
-            ## [facerecognizer]
-
-            cosine_similarity_threshold = 0.363
-            l2_similarity_threshold = 1.128
-
-            ## [match]
-            cosine_score = recognizer.match(face1_feature, face2_feature, cv2.FaceRecognizerSF_FR_COSINE)
-            l2_score = recognizer.match(face1_feature, face2_feature, cv2.FaceRecognizerSF_FR_NORM_L2)
-            ## [match]
-
-            msg = 'different identities'
-            if cosine_score >= cosine_similarity_threshold:
-                msg = 'the same identity'
-            print('They have {}. Cosine Similarity: {}, threshold: {} (higher value means higher similarity, max 1.0).'.format(msg, cosine_score, cosine_similarity_threshold))
-
-            msg = 'different identities'
-            if l2_score <= l2_similarity_threshold:
-                msg = 'the same identity'
-            print('They have {}. NormL2 Distance: {}, threshold: {} (lower value means higher similarity, min 0.0).'.format(msg, l2_score, l2_similarity_threshold))
-        cv2.waitKey(0)
-    else: # Omit input to call default camera
-
-        identities: list[tuple]
-        recognizer: any
-        identities, recognizer = extract_identities(args.database)
-
-        if args.video is not None:
-            print(args.video)
-            deviceId = int(args.video)
-        else:
-            deviceId = 0
-        cap = cv2.VideoCapture(deviceId)
-        frameWidth = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)*args.scale)
-        frameHeight = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)*args.scale)
-        detector.setInputSize([frameWidth, frameHeight])
-
-        while cv2.waitKey(1) < 0:
-            start = time.process_time()
-            hasFrame, frame = cap.read()
-            if not hasFrame:
-                print('No frames grabbed!')
-                break
-
-            frame: cv2.Mat = cv2.resize(frame, (frameWidth, frameHeight))
-
-            # Inference
-            tm.start()
-            faces = detector.detect(frame) # faces is a tuple
-            tm.stop()
-
-            # Draw results on the input image
-            visualize(frame, faces, tm.getFPS(), recognizer=recognizer, identities=identities)
-
-            # Visualize results
-            cv2.imshow('Live', frame)
-            end = time.process_time()
-            print(end - start)
+        # Visualize results
+        cv2.imshow('Live', frame)
+        end = time.process_time()
+        print('Frame time: %.3f' % (end - start))
     cv2.destroyAllWindows()
